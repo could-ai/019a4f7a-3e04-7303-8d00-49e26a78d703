@@ -3,8 +3,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:flutter_ffmpeg/flutter_ffmpeg.dart';
 import 'package:video_player/video_player.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:gallery_saver/gallery_saver.dart';
 import 'dart:io';
-import 'dart:math';
 
 void main() {
   runApp(const MyApp());
@@ -20,6 +20,7 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: const HomePage(),
     );
@@ -34,18 +35,26 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  // For iOS, you need to add the following to your Info.plist file:
+  // <key>NSPhotoLibraryAddUsageDescription</key>
+  // <string>This app needs access to your photo library to save videos.</string>
+
   final ImagePicker _picker = ImagePicker();
   final FlutterFFmpeg _flutterFFmpeg = FlutterFFmpeg();
   List<XFile> _selectedImages = [];
   String? _outputVideoPath;
   bool _isGenerating = false;
+  bool _isSaving = false;
   VideoPlayerController? _videoController;
 
   Future<void> _pickImages() async {
     final List<XFile> images = await _picker.pickMultiImage();
-    if (images != null) {
+    if (images.isNotEmpty) {
       setState(() {
         _selectedImages = images;
+        _outputVideoPath = null;
+        _videoController?.dispose();
+        _videoController = null;
       });
     }
   }
@@ -57,32 +66,35 @@ class _HomePageState extends State<HomePage> {
       _isGenerating = true;
     });
 
+    Directory? inputDir;
     try {
       final directory = await getApplicationDocumentsDirectory();
-      final inputDir = Directory('${directory.path}/input');
+      inputDir = Directory('${directory.path}/input');
+      if (await inputDir.exists()) {
+        await inputDir.delete(recursive: true);
+      }
       await inputDir.create(recursive: true);
 
-      // Copy selected images to input directory with numbered names
       for (int i = 0; i < _selectedImages.length; i++) {
         final imageFile = File(_selectedImages[i].path);
-        final newPath = '${inputDir.path}/image_${(i + 1).toString().padLeft(4, '0')}.jpg';
+        final newPath =
+            '${inputDir.path}/image_${(i + 1).toString().padLeft(4, '0')}.jpg';
         await imageFile.copy(newPath);
       }
 
-      // Generate output video path
-      _outputVideoPath = '${directory.path}/output_video.mp4';
-
-      // FFmpeg command to create video from images
-      final command = '-framerate 1 -i ${inputDir.path}/image_%04d.jpg -c:v libx264 -pix_fmt yuv420p $_outputVideoPath';
+      _outputVideoPath = '${directory.path}/output_${DateTime.now().millisecondsSinceEpoch}.mp4';
+      if (File(_outputVideoPath!).existsSync()) {
+        await File(_outputVideoPath!).delete();
+      }
+      
+      final command = '-framerate 1 -i ${inputDir.path}/image_%04d.jpg -c:v libx264 -r 30 -pix_fmt yuv420p $_outputVideoPath';
 
       final result = await _flutterFFmpeg.execute(command);
       if (result == 0) {
-        // Success
         _initializeVideoPlayer();
       } else {
-        // Error
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Failed to generate video')),
+          const SnackBar(content: Text('Failed to generate video. Please try again.')),
         );
       }
     } catch (e) {
@@ -93,6 +105,9 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _isGenerating = false;
       });
+      if (inputDir != null && await inputDir.exists()) {
+        await inputDir.delete(recursive: true);
+      }
     }
   }
 
@@ -101,7 +116,38 @@ class _HomePageState extends State<HomePage> {
       _videoController = VideoPlayerController.file(File(_outputVideoPath!))
         ..initialize().then((_) {
           setState(() {});
+          _videoController?.play();
+          _videoController?.setLooping(true);
         });
+    }
+  }
+
+  Future<void> _saveVideo() async {
+    if (_outputVideoPath == null) return;
+
+    setState(() {
+      _isSaving = true;
+    });
+
+    try {
+      final bool? success = await GallerySaver.saveVideo(_outputVideoPath!);
+      if (success == true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Video saved to gallery!')),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to save video.')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error saving video: $e')),
+      );
+    } finally {
+      setState(() {
+        _isSaving = false;
+      });
     }
   }
 
@@ -122,9 +168,10 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            ElevatedButton(
+            ElevatedButton.icon(
               onPressed: _pickImages,
-              child: const Text('Pick Images'),
+              icon: const Icon(Icons.image),
+              label: const Text('Pick Images'),
             ),
             const SizedBox(height: 16),
             if (_selectedImages.isNotEmpty)
@@ -137,43 +184,79 @@ class _HomePageState extends State<HomePage> {
                   ),
                   itemCount: _selectedImages.length,
                   itemBuilder: (context, index) {
-                    return Image.file(
-                      File(_selectedImages[index].path),
-                      fit: BoxFit.cover,
+                    return ClipRRect(
+                      borderRadius: BorderRadius.circular(8.0),
+                      child: Image.file(
+                        File(_selectedImages[index].path),
+                        fit: BoxFit.cover,
+                      ),
                     );
                   },
                 ),
               ),
             if (_selectedImages.isNotEmpty)
-              ElevatedButton(
+              ElevatedButton.icon(
                 onPressed: _isGenerating ? null : _generateVideo,
-                child: _isGenerating
-                    ? const CircularProgressIndicator()
+                icon: const Icon(Icons.movie),
+                label: _isGenerating
+                    ? const Text('Generating...')
                     : const Text('Generate Video'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+            if (_isGenerating)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16.0),
+                child: Center(child: CircularProgressIndicator()),
               ),
             const SizedBox(height: 16),
             if (_videoController != null && _videoController!.value.isInitialized)
-              AspectRatio(
-                aspectRatio: _videoController!.value.aspectRatio,
-                child: VideoPlayer(_videoController!),
-              ),
-            if (_videoController != null && _videoController!.value.isInitialized)
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  IconButton(
-                    onPressed: () {
-                      setState(() {
-                        _videoController!.value.isPlaying
-                            ? _videoController!.pause()
-                            : _videoController!.play();
-                      });
-                    },
-                    icon: Icon(
-                      _videoController!.value.isPlaying ? Icons.pause : Icons.play_arrow,
+              Expanded(
+                child: Column(
+                  children: [
+                    AspectRatio(
+                      aspectRatio: _videoController!.value.aspectRatio,
+                      child: VideoPlayer(_videoController!),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        IconButton(
+                          onPressed: () {
+                            setState(() {
+                              _videoController!.value.isPlaying
+                                  ? _videoController!.pause()
+                                  : _videoController!.play();
+                            });
+                          },
+                          icon: Icon(
+                            _videoController!.value.isPlaying
+                                ? Icons.pause_circle_filled
+                                : Icons.play_circle_filled,
+                            size: 40,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        ElevatedButton.icon(
+                          onPressed: _isSaving ? null : _saveVideo,
+                          icon: _isSaving
+                              ? const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white,
+                                  ),
+                                )
+                              : const Icon(Icons.save_alt),
+                          label: const Text('Save to Gallery'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
           ],
         ),
